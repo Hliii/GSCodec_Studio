@@ -1466,3 +1466,77 @@ def rasterization_2dgs_inria_wrapper(
         "gaussian_ids": None,
     }
     return (render_colors, render_alphas), meta
+
+def view_to_visible_anchors(
+    means: Tensor,  # [N, 3]
+    quats: Tensor,  # [N, 4]
+    scales: Tensor,  # [N, 3]
+    viewmats: Tensor,  # [C, 4, 4]
+    Ks: Tensor,  # [C, 3, 3]
+    width: int,
+    height: int,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    eps2d: float = 0.3,
+    sh_degree: Optional[int] = None,
+    packed: bool = True,
+    rasterize_mode: Literal["classic", "antialiased"] = "classic",
+    camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
+    covars: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Dict]:
+    """
+    return mask to select visibal anchors
+    reference from https://github.com/MrNeRF/gsplat/tree/gs-scaffold
+    """
+    N = means.shape[0]
+    C = viewmats.shape[0]
+    assert means.shape == (N, 3), means.shape
+    if covars is None:
+        assert quats.shape == (N, 4), quats.shape
+        assert scales.shape == (N, 3), scales.shape
+    else:
+        assert covars.shape == (N, 3, 3), covars.shape
+        quats, scales = None, None
+        # convert covars from 3x3 matrix to upper-triangular 6D vector
+        tri_indices = ([0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2])
+        covars = covars[..., tri_indices[0], tri_indices[1]]
+    assert viewmats.shape == (C, 4, 4), viewmats.shape
+    assert Ks.shape == (C, 3, 3), Ks.shape
+
+    # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+    proj_results = fully_fused_projection(
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d=eps2d,
+        packed=packed,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        radius_clip=radius_clip,
+        sparse_grad=False,
+        calc_compensations=(rasterize_mode == "antialiased"),
+        camera_model=camera_model,
+    )
+
+    if packed:
+        # The results are packed into shape [nnz, ...]. All elements are valid.
+        (
+            _,
+            _,
+            radii,
+            _,
+            _,
+            _,
+            _,
+        ) = proj_results
+    else:
+        # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
+        radii, _, _, _, _ = proj_results
+
+    return radii.squeeze(0) > 0
